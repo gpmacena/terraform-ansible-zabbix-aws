@@ -1,0 +1,104 @@
+---
+# ─────────────────────────────────────────────────────────
+# Role: zabbix_agent
+# Instala e configura Zabbix Agent 2 nas VMs monitoradas
+# Ubuntu 22.04 / Zabbix 7.0 LTS
+# ─────────────────────────────────────────────────────────
+
+- name: Instalar pacotes base
+  ansible.builtin.apt:
+    name: "{{ common_packages }}"
+    state: present
+    update_cache: true
+  become: true
+
+- name: Adicionar repositório Zabbix {{ zabbix_version }}
+  ansible.builtin.apt:
+    deb: "https://repo.zabbix.com/zabbix/{{ zabbix_version }}/ubuntu/pool/main/z/zabbix-release/zabbix-release_latest_{{ zabbix_version }}+ubuntu22.04_all.deb"
+    state: present
+  become: true
+
+- name: Atualizar apt cache
+  ansible.builtin.apt:
+    update_cache: true
+  become: true
+
+- name: Instalar Zabbix Agent 2
+  ansible.builtin.apt:
+    name: zabbix-agent2
+    state: present
+  become: true
+
+- name: Configurar Zabbix Agent 2
+  ansible.builtin.template:
+    src: zabbix_agent2.conf.j2
+    dest: /etc/zabbix/zabbix_agent2.conf
+    owner: root
+    group: zabbix
+    mode: "0640"
+  become: true
+  notify: Restart zabbix-agent2
+
+- name: Garantir que Zabbix Agent 2 está rodando
+  ansible.builtin.service:
+    name: zabbix-agent2
+    state: started
+    enabled: true
+  become: true
+
+# ── Auto-registro no Zabbix Server via API ───────────────
+- name: Registrar host no Zabbix Server via API
+  ansible.builtin.uri:
+    url: "http://{{ zabbix_server_ip }}/zabbix/api_jsonrpc.php"
+    method: POST
+    headers:
+      Content-Type: application/json
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: user.login
+      params:
+        username: "{{ zabbix_admin_user }}"
+        password: "{{ zabbix_admin_password }}"
+      id: 1
+  register: auth_result
+  delegate_to: localhost
+  no_log: true
+
+- name: Criar host no Zabbix via API
+  ansible.builtin.uri:
+    url: "http://{{ zabbix_server_ip }}/zabbix/api_jsonrpc.php"
+    method: POST
+    headers:
+      Content-Type: application/json
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: host.create
+      params:
+        host: "{{ inventory_hostname }}"
+        name: "Agent - {{ inventory_hostname }}"
+        interfaces:
+          - type: 1           # Zabbix Agent
+            main: 1
+            useip: 1
+            ip: "{{ ansible_host }}"
+            dns: ""
+            port: "{{ zabbix_agent_listen_port | string }}"
+        groups:
+          - groupid: "2"      # Linux servers (grupo padrão)
+        templates:
+          - templateid: "10001"  # Linux by Zabbix agent
+        status: 0
+      auth: "{{ auth_result.json.result }}"
+      id: 2
+  delegate_to: localhost
+  when: auth_result.json.result is defined
+  register: host_create
+  failed_when:
+    - host_create.json.error is defined
+    - "'already exists' not in (host_create.json.error.data | default(''))"
+
+- name: Exibir resultado do registro
+  ansible.builtin.debug:
+    msg: "✅ Host {{ inventory_hostname }} ({{ ansible_host }}) registrado no Zabbix Server"

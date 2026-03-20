@@ -1,0 +1,29 @@
+# Inventário dinâmico AWS EC2
+# Requer: boto3, botocore e collection amazon.aws instalados
+# Filtra instâncias pela tag Env (definida via ZABBIX_ENV_TAG)
+
+plugin: amazon.aws.aws_ec2
+
+regions:
+  - "{{ lookup('env', 'AWS_REGION') | default('us-east-1') }}"
+
+filters:
+  instance-state-name: running
+  "tag:Env": "{{ lookup('env', 'ZABBIX_ENV_TAG') | default('staging') }}"
+  "tag:Project": zabbix-stack
+
+# Usar IP público para conexão via GitHub Actions
+hostnames:
+  - public-ip-address
+  - dns-name
+
+# Agrupar instâncias pela tag Role
+keyed_groups:
+  - key: tags.Role
+    prefix: ""
+    separator: ""
+
+# Variáveis extras injetadas no inventário
+compose:
+  ansible_host: public_ip_address
+  zabbix_role: tags.Role

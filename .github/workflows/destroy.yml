@@ -1,0 +1,82 @@
+name: 💣 Destroy Zabbix Stack
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Ambiente a destruir"
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+      confirm:
+        description: "Digite DESTROY para confirmar"
+        required: true
+        type: string
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  TF_VAR_environment: ${{ github.event.inputs.environment }}
+  TF_VAR_agent_count: "0"
+  TF_VAR_aws_region: ${{ secrets.AWS_REGION }}
+  TF_VAR_key_name: ${{ secrets.AWS_KEY_PAIR_NAME }}
+
+jobs:
+  guard:
+    name: 🛡️ Confirmação de Segurança
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validar confirmação
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "DESTROY" ]; then
+            echo "❌ Confirmação inválida. Digite exatamente 'DESTROY' para prosseguir."
+            exit 1
+          fi
+          echo "✅ Confirmação aceita. Prosseguindo com a destruição do ambiente '${{ github.event.inputs.environment }}'."
+
+  terraform-destroy:
+    name: 💥 Terraform Destroy
+    runs-on: ubuntu-latest
+    needs: guard
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.0
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=zabbix/${{ github.event.inputs.environment }}/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Terraform Plan Destroy
+        working-directory: terraform
+        run: terraform plan -destroy -out=destroy.tfplan -input=false
+
+      - name: Terraform Destroy
+        working-directory: terraform
+        run: terraform apply -auto-approve destroy.tfplan
+
+      - name: Summary
+        run: |
+          echo "## 💣 Ambiente destruído com sucesso" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Ambiente**: ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Executado por**: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Data/Hora**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY

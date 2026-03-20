@@ -1,0 +1,11 @@
+---
+# Playbook: Instala Zabbix Agent 2 e registra hosts
+# Executa em todas as instâncias com tag Role=zabbix-agent
+
+- name: Instalar e registrar Zabbix Agents
+  hosts: zabbixagent   # grupo gerado pelo inventário dinâmico (tag Role)
+  gather_facts: true
+  become: true
+
+  roles:
+    - role: zabbix_agent

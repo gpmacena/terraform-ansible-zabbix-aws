@@ -1,0 +1,211 @@
+name: 🚀 Deploy Zabbix Stack
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Ambiente de destino"
+        required: true
+        default: "staging"
+        type: choice
+        options:
+          - staging
+          - production
+      agent_count:
+        description: "Número de VMs com Zabbix Agent"
+        required: true
+        default: "2"
+        type: string
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  TF_VAR_environment: ${{ github.event.inputs.environment }}
+  TF_VAR_agent_count: ${{ github.event.inputs.agent_count }}
+  TF_VAR_aws_region: ${{ secrets.AWS_REGION }}
+  TF_VAR_key_name: ${{ secrets.AWS_KEY_PAIR_NAME }}
+
+jobs:
+  # ─────────────────────────────────────────────
+  # JOB 1 — Terraform: provisiona a infraestrutura
+  # ─────────────────────────────────────────────
+  terraform:
+    name: 🏗️ Terraform – Provision AWS
+    runs-on: ubuntu-latest
+    outputs:
+      zabbix_server_ip: ${{ steps.outputs.outputs.zabbix_server_ip }}
+      zabbix_server_id: ${{ steps.outputs.outputs.zabbix_server_id }}
+      agent_ids: ${{ steps.outputs.outputs.agent_ids }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.0
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=zabbix/${{ github.event.inputs.environment }}/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Terraform Validate
+        working-directory: terraform
+        run: terraform validate
+
+      - name: Terraform Plan
+        working-directory: terraform
+        run: terraform plan -out=tfplan -input=false
+
+      - name: Terraform Apply
+        working-directory: terraform
+        run: terraform apply -auto-approve tfplan
+
+      - name: Capture Outputs
+        id: outputs
+        working-directory: terraform
+        run: |
+          echo "zabbix_server_ip=$(terraform output -raw zabbix_server_public_ip)" >> $GITHUB_OUTPUT
+          echo "zabbix_server_id=$(terraform output -raw zabbix_server_id)"        >> $GITHUB_OUTPUT
+          echo "agent_ids=$(terraform output -json agent_instance_ids)"            >> $GITHUB_OUTPUT
+
+  # ─────────────────────────────────────────────
+  # JOB 2 — Ansible: configura Zabbix Server
+  # ─────────────────────────────────────────────
+  ansible-server:
+    name: ⚙️ Ansible – Zabbix Server
+    runs-on: ubuntu-latest
+    needs: terraform
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Python & Ansible
+        run: |
+          pip install --quiet ansible boto3 botocore
+          ansible-galaxy collection install amazon.aws community.zabbix --force
+
+      - name: Write SSH Key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/zabbix_key
+          chmod 600 ~/.ssh/zabbix_key
+
+      - name: Wait for SSH readiness
+        run: |
+          echo "⏳ Aguardando instâncias ficarem prontas..."
+          for i in $(seq 1 20); do
+            if ssh -o StrictHostKeyChecking=no \
+                   -o ConnectTimeout=5 \
+                   -i ~/.ssh/zabbix_key \
+                   ubuntu@${{ needs.terraform.outputs.zabbix_server_ip }} "echo ok" 2>/dev/null; then
+              echo "✅ SSH disponível"
+              break
+            fi
+            echo "Tentativa $i/20 — aguardando 15s..."
+            sleep 15
+          done
+
+      - name: Run Playbook – Zabbix Server
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+          ANSIBLE_REMOTE_USER: ubuntu
+          ANSIBLE_PRIVATE_KEY_FILE: ~/.ssh/zabbix_key
+          AWS_REGION: ${{ env.AWS_REGION }}
+          ZABBIX_ENV_TAG: ${{ github.event.inputs.environment }}
+        run: |
+          ansible-playbook \
+            -i inventory/aws_ec2.yml \
+            zabbix_server.yml \
+            --extra-vars "zabbix_server_ip=${{ needs.terraform.outputs.zabbix_server_ip }}"
+
+      - name: Show Zabbix URL
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════════════════╗"
+          echo "║  ✅ Zabbix Server pronto!                            ║"
+          echo "║  🌐 URL : http://${{ needs.terraform.outputs.zabbix_server_ip }}/zabbix  ║"
+          echo "║  👤 User: Admin                                      ║"
+          echo "║  🔑 Pass: (definido em ZABBIX_ADMIN_PASSWORD secret) ║"
+          echo "╚══════════════════════════════════════════════════════╝"
+
+  # ─────────────────────────────────────────────
+  # JOB 3 — Ansible: instala Agents nas EC2s
+  # ─────────────────────────────────────────────
+  ansible-agents:
+    name: ⚙️ Ansible – Zabbix Agents
+    runs-on: ubuntu-latest
+    needs:
+      - terraform
+      - ansible-server
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Python & Ansible
+        run: |
+          pip install --quiet ansible boto3 botocore
+          ansible-galaxy collection install amazon.aws community.zabbix --force
+
+      - name: Write SSH Key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/zabbix_key
+          chmod 600 ~/.ssh/zabbix_key
+
+      - name: Wait for Agents SSH
+        run: sleep 30
+
+      - name: Run Playbook – Zabbix Agents
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+          ANSIBLE_REMOTE_USER: ubuntu
+          ANSIBLE_PRIVATE_KEY_FILE: ~/.ssh/zabbix_key
+          AWS_REGION: ${{ env.AWS_REGION }}
+          ZABBIX_ENV_TAG: ${{ github.event.inputs.environment }}
+        run: |
+          ansible-playbook \
+            -i inventory/aws_ec2.yml \
+            zabbix_agents.yml \
+            --extra-vars "zabbix_server_ip=${{ needs.terraform.outputs.zabbix_server_ip }}"
+
+      - name: Summary
+        run: |
+          echo "## 🎉 Deploy concluído!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Recurso | Valor |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 🖥️ Zabbix URL | http://${{ needs.terraform.outputs.zabbix_server_ip }}/zabbix |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔌 API URL | http://${{ needs.terraform.outputs.zabbix_server_ip }}/zabbix/api_jsonrpc.php |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🤖 Agents | ${{ github.event.inputs.agent_count }} instâncias |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🌍 Ambiente | ${{ github.event.inputs.environment }} |" >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,36 @@
+# ─────────────────────────────────────────────────────────
+# Variáveis globais — sobrescreva via --extra-vars na pipeline
+# ─────────────────────────────────────────────────────────
+
+# Versão do Zabbix (7.0 LTS)
+zabbix_version: "7.0"
+zabbix_version_minor: "7.0.3"
+
+# Banco de dados (PostgreSQL no mesmo servidor)
+zabbix_db_host: "localhost"
+zabbix_db_name: "zabbix"
+zabbix_db_user: "zabbix"
+zabbix_db_password: "{{ lookup('env', 'ZABBIX_DB_PASSWORD') | default('Zabbix@DB#2024!') }}"
+
+# Usuário admin do Zabbix
+zabbix_admin_user: "Admin"
+zabbix_admin_password: "{{ lookup('env', 'ZABBIX_ADMIN_PASSWORD') | default('Zabbix@Admin#2024!') }}"
+
+# IP do servidor Zabbix (passado via --extra-vars na pipeline)
+zabbix_server_ip: "{{ zabbix_server_ip | default('127.0.0.1') }}"
+
+# Configurações do Agent
+zabbix_agent_version: "2"      # Zabbix Agent 2 (recomendado)
+zabbix_agent_server: "{{ zabbix_server_ip }}"
+zabbix_agent_server_active: "{{ zabbix_server_ip }}"
+zabbix_agent_listen_port: 10050
+zabbix_server_port: 10051
+
+# Pacotes Ubuntu necessários
+common_packages:
+  - curl
+  - wget
+  - gnupg
+  - apt-transport-https
+  - ca-certificates
+  - python3-psycopg2

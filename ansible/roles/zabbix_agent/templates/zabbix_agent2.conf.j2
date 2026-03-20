@@ -1,0 +1,22 @@
+# Zabbix Agent 2 Configuration
+# Gerado pelo Ansible — não edite manualmente
+
+PidFile=/run/zabbix/zabbix_agent2.pid
+LogFile=/var/log/zabbix/zabbix_agent2.log
+LogFileSize=0
+
+# Endereço do Zabbix Server (passive checks)
+Server={{ zabbix_agent_server }}
+
+# Endereço para active checks
+ServerActive={{ zabbix_agent_server_active }}
+
+# Nome único do host (usa o IP público da instância)
+Hostname={{ inventory_hostname }}
+
+ListenPort={{ zabbix_agent_listen_port }}
+
+EnableRemoteCommands=0
+LogRemoteCommands=1
+
+ControlSocket=/tmp/agent.sock

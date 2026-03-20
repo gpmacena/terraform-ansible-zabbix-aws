@@ -1,0 +1,218 @@
+---
+# ─────────────────────────────────────────────────────────
+# Role: zabbix_server
+# Instala e configura: PostgreSQL + Zabbix Server + Frontend
+# Ubuntu 22.04 / Zabbix 7.0 LTS
+# ─────────────────────────────────────────────────────────
+
+- name: Instalar pacotes base
+  ansible.builtin.apt:
+    name: "{{ common_packages }}"
+    state: present
+    update_cache: true
+  become: true
+
+# ── PostgreSQL ───────────────────────────────────────────
+- name: Instalar PostgreSQL
+  ansible.builtin.apt:
+    name:
+      - postgresql
+      - postgresql-contrib
+      - python3-psycopg2
+    state: present
+  become: true
+
+- name: Garantir que PostgreSQL está rodando
+  ansible.builtin.service:
+    name: postgresql
+    state: started
+    enabled: true
+  become: true
+
+- name: Criar usuário do banco Zabbix
+  community.postgresql.postgresql_user:
+    name: "{{ zabbix_db_user }}"
+    password: "{{ zabbix_db_password }}"
+    state: present
+  become: true
+  become_user: postgres
+
+- name: Criar banco de dados Zabbix
+  community.postgresql.postgresql_db:
+    name: "{{ zabbix_db_name }}"
+    owner: "{{ zabbix_db_user }}"
+    encoding: UTF8
+    lc_collate: en_US.UTF-8
+    lc_ctype: en_US.UTF-8
+    template: template0
+    state: present
+  become: true
+  become_user: postgres
+
+# ── Repositório Zabbix ───────────────────────────────────
+- name: Adicionar repositório Zabbix {{ zabbix_version }}
+  ansible.builtin.apt:
+    deb: "https://repo.zabbix.com/zabbix/{{ zabbix_version }}/ubuntu/pool/main/z/zabbix-release/zabbix-release_latest_{{ zabbix_version }}+ubuntu22.04_all.deb"
+    state: present
+  become: true
+
+- name: Atualizar apt cache após adicionar repositório
+  ansible.builtin.apt:
+    update_cache: true
+  become: true
+
+# ── Zabbix Server ────────────────────────────────────────
+- name: Instalar Zabbix Server, Frontend e Agent 2
+  ansible.builtin.apt:
+    name:
+      - zabbix-server-pgsql
+      - zabbix-frontend-php
+      - zabbix-apache-conf
+      - zabbix-sql-scripts
+      - zabbix-agent2
+    state: present
+  become: true
+
+- name: Verificar se schema já foi importado
+  ansible.builtin.stat:
+    path: /etc/zabbix/.schema_imported
+  register: schema_flag
+
+- name: Importar schema inicial do Zabbix
+  ansible.builtin.shell: |
+    zcat /usr/share/zabbix-sql-scripts/postgresql/server.sql.gz | \
+    PGPASSWORD="{{ zabbix_db_password }}" psql \
+      -h localhost -U {{ zabbix_db_user }} {{ zabbix_db_name }}
+  become: true
+  when: not schema_flag.stat.exists
+  no_log: true
+
+- name: Marcar schema como importado
+  ansible.builtin.file:
+    path: /etc/zabbix/.schema_imported
+    state: touch
+    mode: "0644"
+  become: true
+  when: not schema_flag.stat.exists
+
+- name: Configurar zabbix_server.conf
+  ansible.builtin.template:
+    src: zabbix_server.conf.j2
+    dest: /etc/zabbix/zabbix_server.conf
+    owner: root
+    group: zabbix
+    mode: "0640"
+  become: true
+  notify: Restart zabbix-server
+
+- name: Garantir que Zabbix Server está rodando
+  ansible.builtin.service:
+    name: zabbix-server
+    state: started
+    enabled: true
+  become: true
+
+# ── Frontend / Apache ────────────────────────────────────
+- name: Garantir que Apache está rodando
+  ansible.builtin.service:
+    name: apache2
+    state: started
+    enabled: true
+  become: true
+
+- name: Configurar frontend Zabbix (zabbix.conf.php)
+  ansible.builtin.template:
+    src: zabbix.conf.php.j2
+    dest: /etc/zabbix/web/zabbix.conf.php
+    owner: www-data
+    group: www-data
+    mode: "0644"
+  become: true
+  notify: Restart apache2
+
+# ── Zabbix Agent 2 (monitorar o próprio servidor) ────────
+- name: Configurar Zabbix Agent 2 no servidor
+  ansible.builtin.template:
+    src: zabbix_agent2.conf.j2
+    dest: /etc/zabbix/zabbix_agent2.conf
+    owner: root
+    group: zabbix
+    mode: "0640"
+  become: true
+  notify: Restart zabbix-agent2
+
+- name: Garantir que Zabbix Agent 2 está rodando
+  ansible.builtin.service:
+    name: zabbix-agent2
+    state: started
+    enabled: true
+  become: true
+
+# ── API: alterar senha do Admin via API ──────────────────
+- name: Aguardar API Zabbix ficar disponível
+  ansible.builtin.uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    headers:
+      Content-Type: application/json
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: user.login
+      params:
+        username: Admin
+        password: zabbix
+      id: 1
+    status_code: [200]
+    return_content: true
+  register: api_check
+  retries: 15
+  delay: 10
+  until: api_check.status == 200 and api_check.json.result is defined
+
+- name: Alterar senha padrão do Admin
+  ansible.builtin.uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    headers:
+      Content-Type: application/json
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: user.update
+      params:
+        userid: "1"
+        passwd: "{{ zabbix_admin_password }}"
+      auth: "{{ api_check.json.result }}"
+      id: 2
+  when: api_check.json.result is defined
+  no_log: true
+
+- name: Criar token de API para integração (Avents)
+  ansible.builtin.uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    headers:
+      Content-Type: application/json
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: token.create
+      params:
+        name: "avents-integration"
+        userid: "1"
+        description: "Token para integração com Avents"
+        status: 0
+      auth: "{{ api_check.json.result }}"
+      id: 3
+  register: token_result
+  when: api_check.json.result is defined
+
+- name: Exibir informações da API
+  ansible.builtin.debug:
+    msg:
+      - "✅ Zabbix Server configurado com sucesso!"
+      - "🌐 Frontend: http://{{ ansible_host }}/zabbix"
+      - "🔌 API: http://{{ ansible_host }}/zabbix/api_jsonrpc.php"
+      - "👤 Usuário: {{ zabbix_admin_user }}"
+      - "🔑 Token Avents ID: {{ token_result.json.result.tokenids[0] | default('N/A') }}"
